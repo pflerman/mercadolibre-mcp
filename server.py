@@ -465,6 +465,22 @@ def get_item_promotions(item_id: str) -> str:
     return _fmt(ml.get(f"/seller-promotions/items/{item_id}?app_version=v2"))
 
 
+@mcp.tool()
+def apply_promotion(item_id: str, promotion_id: str, promotion_type: str, offer_id: str = "", price: float = 0) -> str:
+    """Apply a promotion to an item.
+    For SMART: pass promotion_id, promotion_type='SMART', offer_id (the ref_id from get_item_promotions).
+    For DEAL: pass promotion_id, promotion_type='DEAL', price (within min/max range)."""
+    body: dict = {"promotion_id": promotion_id, "promotion_type": promotion_type}
+    if offer_id:
+        body["offer_id"] = offer_id
+    if price:
+        body["price"] = price
+    return _fmt(ml.post(
+        f"/seller-promotions/items/{item_id}?app_version=v2",
+        json_data=body,
+    ))
+
+
 # ============================= PRICES ======================================
 
 @mcp.tool()
@@ -502,7 +518,10 @@ def get_ad_campaigns() -> str:
     """Get Product Ads campaigns with metrics."""
     try:
         adv = ml.get("/advertising/advertisers?product_id=PADS")
+        # Response can be {"advertisers": [...]} or direct {"id": ...}
         adv_id = adv.get("id") or adv.get("advertiser_id")
+        if not adv_id and isinstance(adv.get("advertisers"), list) and adv["advertisers"]:
+            adv_id = adv["advertisers"][0].get("advertiser_id") or adv["advertisers"][0].get("id")
         if not adv_id:
             return _fmt({"error": "No advertiser found", "raw": adv})
         return _fmt(ml.get(f"/advertising/advertisers/{adv_id}/product_ads/campaigns"))
