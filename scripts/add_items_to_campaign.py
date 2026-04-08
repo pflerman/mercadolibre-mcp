@@ -68,15 +68,32 @@ async def add_single_item(page, item_id, index, total, add_url):
     await search.press('Enter')
     await page.wait_for_timeout(2500)
 
-    # Select checkbox
+    # Select checkbox. First try matching by MLA id in the row text;
+    # if the search filtered to a single product but the row hides the MLA
+    # (e.g. "family + N variantes" rendering), fall back to selecting the
+    # only product checkbox in the result table — excluding the table-header
+    # "select all" checkbox.
     selected = await page.evaluate(f"""() => {{
-        const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-        for (const cb of checkboxes) {{
-            const container = cb.closest('tr') || cb.closest('[class*="row"]') || cb.closest('[class*="item"]') || cb.parentElement?.parentElement?.parentElement;
-            if (container && container.textContent.includes('{item_id}')) {{
+        const target = '{item_id}';
+        const allCbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        // Restrict to checkboxes inside data rows (not the header "select all")
+        const rowCbs = allCbs.filter(cb => {{
+            const row = cb.closest('tr,[role=row]');
+            return row && !row.closest('thead');
+        }});
+        // 1. Try exact MLA match on row text
+        for (const cb of rowCbs) {{
+            const row = cb.closest('tr,[role=row]');
+            if (row && row.textContent.includes(target)) {{
                 if (!cb.checked) cb.click();
-                return true;
+                return 'matched-mla';
             }}
+        }}
+        // 2. Fallback: if there's exactly one product row, select it
+        //    (search filter narrowed the result down to one family)
+        if (rowCbs.length === 1) {{
+            if (!rowCbs[0].checked) rowCbs[0].click();
+            return 'matched-single';
         }}
         return false;
     }}""")
