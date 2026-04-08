@@ -716,6 +716,242 @@ def get_missed_notifications(topic: str = "") -> str:
 
 
 # ===========================================================================
+# COMPACT TOOLS — versiones resumidas para evitar inflar contexto
+# ===========================================================================
+#
+# Patrón: cada tool _summary devuelve solo los campos importantes para
+# decisiones humanas (típicamente ~30-50 líneas vs 200+ del raw). Usalas
+# por default cuando solo necesites "info rápida" — las versiones full
+# siguen disponibles si necesitás detalles específicos.
+
+def _summarize_order(order: dict) -> dict:
+    """Resumen compacto de una order de ML."""
+    items = []
+    for oi in order.get("order_items") or []:
+        item = oi.get("item") or {}
+        items.append({
+            "item_id": item.get("id"),
+            "title": item.get("title"),
+            "variation_id": item.get("variation_id"),
+            "seller_sku": item.get("seller_sku") or item.get("seller_custom_field"),
+            "quantity": oi.get("quantity"),
+            "unit_price": oi.get("unit_price"),
+            "sale_fee": oi.get("sale_fee"),
+        })
+    payments = order.get("payments") or []
+    first_payment = payments[0] if payments else {}
+    buyer = order.get("buyer") or {}
+    shipping = order.get("shipping") or {}
+    return {
+        "id": order.get("id"),
+        "date_created": order.get("date_created"),
+        "date_closed": order.get("date_closed"),
+        "status": order.get("status"),
+        "status_detail": order.get("status_detail"),
+        "total_amount": order.get("total_amount"),
+        "paid_amount": order.get("paid_amount"),
+        "currency": order.get("currency_id"),
+        "buyer": {
+            "id": buyer.get("id"),
+            "nickname": buyer.get("nickname"),
+        },
+        "items": items,
+        "payment_id": first_payment.get("id"),
+        "payment_method": first_payment.get("payment_method_id"),
+        "payment_status": first_payment.get("status"),
+        "shipping_id": shipping.get("id"),
+        "shipping_status": shipping.get("status"),
+    }
+
+
+def _summarize_question(q: dict) -> dict:
+    """Resumen compacto de una question."""
+    answer = q.get("answer") or {}
+    sender = q.get("from") or {}
+    return {
+        "id": q.get("id"),
+        "text": q.get("text"),
+        "status": q.get("status"),
+        "date_created": q.get("date_created"),
+        "item_id": q.get("item_id"),
+        "from_id": sender.get("id"),
+        "from_nickname": sender.get("nickname"),
+        "answer_text": answer.get("text") if answer else None,
+        "answer_date": answer.get("date_created") if answer else None,
+    }
+
+
+def _summarize_search_result(item: dict) -> dict:
+    """Resumen compacto de un item devuelto por /sites/{site}/search (público)."""
+    shipping = item.get("shipping") or {}
+    seller = item.get("seller") or {}
+    return {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "permalink": item.get("permalink"),
+        "price": item.get("price"),
+        "currency": item.get("currency_id"),
+        "available_quantity": item.get("available_quantity"),
+        "sold_quantity": item.get("sold_quantity"),
+        "condition": item.get("condition"),
+        "listing_type_id": item.get("listing_type_id"),
+        "category_id": item.get("category_id"),
+        "free_shipping": shipping.get("free_shipping"),
+        "seller_id": seller.get("id"),
+        "seller_nickname": seller.get("nickname"),
+    }
+
+
+def _summarize_billing_doc(doc: dict) -> dict:
+    """Resumen compacto de un documento de billing (los arrays de detalles
+    son enormes y casi nunca importan)."""
+    return {k: v for k, v in doc.items() if not isinstance(v, list)}
+
+
+@mcp.tool()
+def list_items_summary(
+    status: str = "active",
+    offset: int = 0,
+    limit: int = 50,
+    sort: str = "last_updated_desc",
+) -> str:
+    """Lista items del seller con resumen compacto (~30 campos por item).
+    Mucho más liviano que list_items. Usar esta tool por default."""
+    params = {"status": status, "offset": offset, "limit": limit, "sort": sort}
+    search = ml.get(f"/users/{ml.user_id}/items/search", params=params)
+    ids = search.get("results", []) or []
+    if not ids:
+        return _fmt({"total": (search.get("paging") or {}).get("total", 0), "items": []})
+    summaries: list[dict] = []
+    for i in range(0, len(ids), 20):
+        batch = ",".join(ids[i : i + 20])
+        for entry in ml.get(f"/items?ids={batch}"):
+            body = entry.get("body") if isinstance(entry, dict) else None
+            if body:
+                summaries.append(_summarize_item(body))
+    return _fmt({
+        "total": (search.get("paging") or {}).get("total", 0),
+        "count": len(summaries),
+        "items": summaries,
+    })
+
+
+@mcp.tool()
+def list_orders_summary(
+    status: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    offset: int = 0,
+    limit: int = 50,
+    sort: str = "date_desc",
+) -> str:
+    """Lista orders del seller con resumen compacto (id, fecha, comprador,
+    total, status, items con sku/cantidad/precio, payment, shipping).
+    Mucho más liviano que list_orders."""
+    params: dict[str, Any] = {
+        "seller": ml.user_id,
+        "offset": offset,
+        "limit": limit,
+        "sort": sort,
+    }
+    if status:
+        params["order.status"] = status
+    if date_from:
+        params["order.date_created.from"] = date_from
+    if date_to:
+        params["order.date_created.to"] = date_to
+    data = ml.get("/orders/search", params=params)
+    results = data.get("results") or []
+    summaries = [_summarize_order(o) for o in results]
+    return _fmt({
+        "total": (data.get("paging") or {}).get("total", 0),
+        "count": len(summaries),
+        "orders": summaries,
+    })
+
+
+@mcp.tool()
+def get_order_summary(order_id: str) -> str:
+    """Resumen compacto de una order. Usar en vez de get_order cuando solo
+    necesitás info rápida (sin shipping detail completo, sin tags, etc)."""
+    order = ml.get(f"/orders/{order_id}")
+    return _fmt(_summarize_order(order))
+
+
+@mcp.tool()
+def search_by_seller_summary(
+    seller_id: int,
+    site_id: str = "MLA",
+    offset: int = 0,
+    limit: int = 50,
+) -> str:
+    """Búsqueda pública de items por seller con resumen compacto.
+    Mucho más liviano que search_by_seller."""
+    data = ml.get(f"/sites/{site_id}/search", params={
+        "seller_id": seller_id, "offset": offset, "limit": limit,
+    })
+    results = data.get("results") or []
+    summaries = [_summarize_search_result(it) for it in results]
+    return _fmt({
+        "total": (data.get("paging") or {}).get("total", 0),
+        "count": len(summaries),
+        "items": summaries,
+    })
+
+
+@mcp.tool()
+def list_questions_summary(
+    item_id: str = "",
+    status: str = "UNANSWERED",
+    offset: int = 0,
+    limit: int = 50,
+    sort: str = "DATE_CREATED_DESC",
+) -> str:
+    """Lista preguntas del seller con resumen compacto (texto, estado,
+    item, comprador, respuesta si existe). Mucho más liviano que
+    list_questions."""
+    params: dict[str, Any] = {
+        "seller_id": ml.user_id,
+        "api_version": 4,
+        "offset": offset,
+        "limit": limit,
+        "sort_fields": sort,
+    }
+    if item_id:
+        params["item"] = item_id
+    if status and status != "ALL":
+        params["status"] = status
+    data = ml.get("/questions/search", params=params)
+    questions = data.get("questions") or []
+    summaries = [_summarize_question(q) for q in questions]
+    return _fmt({
+        "total": data.get("total", len(summaries)),
+        "count": len(summaries),
+        "questions": summaries,
+    })
+
+
+@mcp.tool()
+def get_billing_detail_summary(period_key: str, group: str = "ML") -> str:
+    """Resumen compacto del billing de un período: solo los totales y
+    metadata de cada documento, sin los arrays de detalle internos
+    (que son enormes). Mucho más liviano que get_billing_detail."""
+    data = ml.get(
+        f"/billing/integration/periods/key/{period_key}/documents?group={group}"
+    )
+    docs = data.get("documents") or data if isinstance(data, list) else (data.get("documents") or [])
+    if not isinstance(docs, list):
+        # estructura inesperada — devolver tal cual
+        return _fmt(data)
+    return _fmt({
+        "period_key": period_key,
+        "group": group,
+        "count": len(docs),
+        "documents": [_summarize_billing_doc(d) for d in docs],
+    })
+
+
+# ===========================================================================
 # Run
 # ===========================================================================
 
