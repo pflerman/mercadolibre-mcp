@@ -81,20 +81,160 @@ def list_items(
     return _fmt({"total": search.get("paging", {}).get("total", 0), "items": items})
 
 
+def _extract_skus_from_item(item: dict) -> list[str]:
+    """Devuelve TODOS los lugares donde puede estar un SKU en un item ML."""
+    skus = []
+    scf = item.get("seller_custom_field")
+    if scf:
+        skus.append(scf)
+    for attr in item.get("attributes") or []:
+        if (attr.get("id") or "").upper() == "SELLER_SKU":
+            v = attr.get("value_name")
+            if v:
+                skus.append(v)
+    for var in item.get("variations") or []:
+        v_scf = var.get("seller_custom_field")
+        if v_scf:
+            skus.append(v_scf)
+        for attr in var.get("attributes") or []:
+            if (attr.get("id") or "").upper() == "SELLER_SKU":
+                v = attr.get("value_name")
+                if v:
+                    skus.append(v)
+    return skus
+
+
+def _find_items_by_sku(sku: str) -> list[dict]:
+    """Búsqueda robusta de items por SKU.
+
+    1. Intenta el endpoint nativo del seller (rápido si el SKU está en
+       seller_custom_field indexado).
+    2. Si vuelve vacío, hace fallback paginando todos los items activos del
+       seller y filtrando client-side por las 3 ubicaciones posibles del SKU.
+    Devuelve lista de items completos (puede ser vacía).
+    """
+    # Intento 1: endpoint nativo
+    search = ml.get(f"/users/{ml.user_id}/items/search", params={"sku": sku})
+    ids = search.get("results", []) or []
+    if ids:
+        items: list[dict] = []
+        for i in range(0, len(ids), 20):
+            batch = ",".join(ids[i : i + 20])
+            for entry in ml.get(f"/items?ids={batch}"):
+                body = entry.get("body") if isinstance(entry, dict) else None
+                if body:
+                    items.append(body)
+        return items
+
+    # Intento 2 (fallback): paginar todos los items activos del seller y filtrar
+    matches: list[dict] = []
+    sku_upper = sku.strip().upper()
+    offset = 0
+    page_size = 50
+    while True:
+        page = ml.get(
+            f"/users/{ml.user_id}/items/search",
+            params={"status": "active", "offset": offset, "limit": page_size},
+        )
+        page_ids = page.get("results", []) or []
+        if not page_ids:
+            break
+        for i in range(0, len(page_ids), 20):
+            batch = ",".join(page_ids[i : i + 20])
+            for entry in ml.get(f"/items?ids={batch}"):
+                body = entry.get("body") if isinstance(entry, dict) else None
+                if not body:
+                    continue
+                item_skus = [s.strip().upper() for s in _extract_skus_from_item(body)]
+                if sku_upper in item_skus:
+                    matches.append(body)
+        offset += page_size
+        total = (page.get("paging") or {}).get("total", 0)
+        if offset >= total:
+            break
+    return matches
+
+
+def _summarize_item(item: dict) -> dict:
+    """Versión compacta de un item ML — solo lo importante para humanos."""
+    shipping = item.get("shipping") or {}
+    summary = {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "permalink": item.get("permalink"),
+        "price": item.get("price"),
+        "currency": item.get("currency_id"),
+        "available_quantity": item.get("available_quantity"),
+        "sold_quantity": item.get("sold_quantity"),
+        "initial_quantity": item.get("initial_quantity"),
+        "status": item.get("status"),
+        "listing_type_id": item.get("listing_type_id"),
+        "category_id": item.get("category_id"),
+        "domain_id": item.get("domain_id"),
+        "condition": item.get("condition"),
+        "free_shipping": shipping.get("free_shipping"),
+        "logistic_type": shipping.get("logistic_type"),
+        "date_created": item.get("date_created"),
+        "last_updated": item.get("last_updated"),
+        "seller_custom_field": item.get("seller_custom_field"),
+        "skus_detected": _extract_skus_from_item(item),
+    }
+    # Atributos clave (marca, color, material, género, talle, modelo, sku oficial)
+    keep_attrs = {"BRAND", "COLOR", "MATERIAL", "GENDER", "SIZE", "MODEL", "SELLER_SKU", "PACKAGE_LENGTH", "PACKAGE_WIDTH", "PACKAGE_HEIGHT"}
+    attrs = {}
+    for a in item.get("attributes") or []:
+        aid = (a.get("id") or "").upper()
+        if aid in keep_attrs and a.get("value_name"):
+            attrs[aid] = a.get("value_name")
+    if attrs:
+        summary["attributes"] = attrs
+    # Variaciones (resumen)
+    vars_ = item.get("variations") or []
+    if vars_:
+        summary["variations_count"] = len(vars_)
+    # Cantidad de fotos
+    pics = item.get("pictures") or []
+    if pics:
+        summary["pictures_count"] = len(pics)
+    return summary
+
+
 @mcp.tool()
 def search_items_by_sku(sku: str) -> str:
-    """Search seller's items by SKU (seller_custom_field)."""
-    search = ml.get(f"/users/{ml.user_id}/items/search", params={"sku": sku})
-    ids = search.get("results", [])
-    if not ids:
-        return _fmt({"results": []})
-    batch = ",".join(ids[:20])
-    return _fmt(ml.get(f"/items?ids={batch}"))
+    """Buscar items del seller por SKU. Devuelve lista de items completos.
+
+    Hace fallback automático: si el endpoint nativo no encuentra el SKU
+    (porque está solo en attributes[SELLER_SKU] o en variations), lista todos
+    los items activos del seller y filtra por las 3 ubicaciones posibles.
+
+    NOTA: para info compacta usá find_item_by_sku — esta tool devuelve
+    objetos full y puede ser pesada.
+    """
+    items = _find_items_by_sku(sku)
+    return _fmt({"sku": sku, "count": len(items), "items": items})
 
 
 @mcp.tool()
-def get_item(item_id: str, include_description: bool = True) -> str:
-    """Get full item details. Optionally includes description."""
+def find_item_by_sku(sku: str) -> str:
+    """Buscar items del seller por SKU y devolver SOLO un resumen compacto
+    (id, title, price, stock, status, permalink, atributos clave).
+
+    Es el modo recomendado para "dame info de la publi con SKU X".
+    Mucho más liviano que search_items_by_sku + get_item.
+
+    Hace búsqueda robusta: prueba el endpoint nativo y si no encuentra,
+    pagina todos los items activos y filtra client-side por seller_custom_field,
+    attributes[SELLER_SKU] y variations[].seller_custom_field.
+    """
+    items = _find_items_by_sku(sku)
+    summaries = [_summarize_item(it) for it in items]
+    return _fmt({"sku": sku, "count": len(summaries), "items": summaries})
+
+
+@mcp.tool()
+def get_item(item_id: str, include_description: bool = False) -> str:
+    """Get full item details. Por default NO incluye description (es larga).
+    Pasar include_description=True solo si la necesitás explícitamente."""
     item = ml.get(f"/items/{item_id}")
     if include_description:
         try:
@@ -103,6 +243,15 @@ def get_item(item_id: str, include_description: bool = True) -> str:
         except Exception:
             item["description"] = None
     return _fmt(item)
+
+
+@mcp.tool()
+def get_item_summary(item_id: str) -> str:
+    """Resumen compacto de un item: solo los campos importantes (~25 líneas).
+    Usar esta tool en vez de get_item cuando solo querés info rápida y no
+    necesitás description, todos los attributes, sale_terms, etc."""
+    item = ml.get(f"/items/{item_id}")
+    return _fmt(_summarize_item(item))
 
 
 @mcp.tool()
@@ -533,6 +682,17 @@ def get_ad_campaigns() -> str:
 def get_item_ad(item_id: str) -> str:
     """Get Product Ads detail and metrics for a specific item."""
     return _fmt(ml.get(f"/advertising/product_ads/items/{item_id}"))
+
+
+@mcp.tool()
+def set_item_campaign(item_id: str, campaign_id: int, status: str = "active") -> str:
+    """Assign an item to a Product Ads campaign (or update its ad status).
+    campaign_id: the campaign ID (e.g. 355566060).
+    status: 'active' or 'paused'."""
+    return _fmt(ml.put(f"/advertising/product_ads/items/{item_id}", {
+        "campaign_id": campaign_id,
+        "status": status,
+    }))
 
 
 # ============================= LISTING TYPES ===============================
